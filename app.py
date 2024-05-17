@@ -11,6 +11,7 @@ import threading
 import shutil
 from config import *
 import json
+import tempfile
 
 AWS_ACCESS_KEY_ID=os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY=os.getenv('AWS_SECRET_ACCESS_KEY')
@@ -86,145 +87,150 @@ def get_image(request_id, extension):
 
 @app.post('/api/v1/image_processing')
 def image_processing():
-    image = request.files['image']
-    import tempfile
-    # Store the image to a temporary file to open it inside the function process. Preserve the extension of the image
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{image.filename.split(".")[-1]}')
-    image.save(temp_file)
+    temp_files = []
+    for image in request.files.getlist('images'):
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{image.filename.split(".")[-1]}')
+        image.save(temp_file)
+        temp_files.append(temp_file)
     operation = request.form.get('operation', Operations.BLUR.name)
-    def process(temp_file):
-        with open(temp_file.name, 'rb') as image:
-            img = Image.open(temp_file.name)
-            # Open the image from the temporary file
-            
-            response = { "event": "", "progress": 0 }
-            
-            # Generate a unique id for the image processing request
-            request_id = str(uuid.uuid4())
+    def process(temp_files):
+        for i, temp_file in enumerate(temp_files):
+            with open(temp_file.name, 'rb') as image:
+                img = Image.open(temp_file.name)
+                # Open the image from the temporary file
 
-            # Read the image as a numpy array
-            extension = image.name.split('.')[-1]
+                response = { "event": "", "progress": 0, "id": i }
+                
+                # Generate a unique id for the image processing request
+                request_id = str(uuid.uuid4())
 
-            response['event'] = f"Image received. Dividing the image into {9} chunks."
-            response['progress'] = 10
-            yield json.dumps(response) + '\n'
-            chunks, n, width, height, padding_w, padding_h = divide_image(img, 3, 10, 10)
+                # Read the image as a numpy array
+                extension = image.name.split('.')[-1]
 
-            pending_chunks = set()
-
-            tmp_folder = f'tmp-{request_id}'
-            if not os.path.exists(tmp_folder):
-                os.makedirs(tmp_folder)
-
-            for i, chunk in enumerate(chunks):
-                response['event'] = f"Uploading chunk {i+1}/{n*n} to the cloud."
-                response['progress'] = 11 + i
+                response['event'] = f"Image received. Dividing the image into {9} chunks."
+                response['progress'] = 10
                 yield json.dumps(response) + '\n'
-                chunk.save(f'{tmp_folder}/{request_id}-{i}.{extension}')
-                pending_chunks.add(i)
-                s3Client.upload_file(f'{tmp_folder}/{request_id}-{i}.{extension}', upload_bucket, f'{request_id}-{i}.{extension}')
+                chunks, n, width, height, padding_w, padding_h = divide_image(img, 3, 10, 10)
 
-            
-            shutil.rmtree(tmp_folder)
+                pending_chunks = set()
 
-            json_message = {
-                'request_id': request_id,
-                'extension': extension,
-                'operation': operation,
-                'padding_w': padding_w,
-                'padding_h': padding_h,
-                'width': width,
-                'height': height,
-            }
+                tmp_folder = f'tmp-{request_id}'
+                if not os.path.exists(tmp_folder):
+                    os.makedirs(tmp_folder)
 
-            channel = f"pending:{request_id}"
-            
-            pubsub = r.pubsub()
-            pubsub.subscribe(channel)
-            
-            # Send message batch to the queue
-            for i, chunk in enumerate(chunks):
-                response['event'] = f"Sending chunk {i+1}/{n*n} to the queue."
-                response['progress'] = 21 + i
-                yield json.dumps(response) + '\n'
-                json_message['chunk_id'] = i
-                encoded_jwt = jwt.encode(json_message, SECRET_KEY, algorithm='HS256')
-                sqsClient.send_message(
-                    QueueUrl=push_queue_url,
-                    MessageBody=encoded_jwt,
-                    MessageGroupId=str(i%2),
-                    MessageDeduplicationId=f"{request_id}+{i}",
-                )
-
-            # r.sadd(f"pending:{request_id}", *pending_chunks)
-            # r.set(f"chunk_count:{request_id}", len(pending_chunks))
-            
-            response['event'] = f"Image processing request sent. Waiting for the processed chunks."
-            response['progress'] = 30
-            yield json.dumps(response) + '\n'
-            while True:
-                message = pubsub.get_message()
-                if message is None: continue
-                print(message)
-                if message['type'] == 'message':
-                    if message['data'] == b'0':
-                        break
-                    
-                    message = message['data']
-                    decoded = jwt.decode(message, SECRET_KEY, algorithms='HS256')
-                    chunk_id = decoded['chunk_id']
-                    pending_chunks.remove(chunk_id)
-                    response['event'] = f"Chunk {chunk_id} processed."
-                    response['progress'] = 30 + (9 - len(pending_chunks)) * 3
+                for i, chunk in enumerate(chunks):
+                    response['event'] = f"Uploading chunk {i+1}/{n*n} to the cloud."
+                    response['progress'] = 11 + i
                     yield json.dumps(response) + '\n'
-                    if len(pending_chunks) == 0:
-                        response['event'] = f"All chunks processed."
-                        yield json.dumps(response) + '\n'
-                        pubsub.unsubscribe(channel)
-                        pubsub.close()
-                        break
-            
-            r.delete(channel)
-            
-            tmp_folder = f'temp-{request_id}'
-            if not os.path.exists(tmp_folder):
-                os.makedirs(tmp_folder)
-            chunks = []
-            response['event'] = f"Downloading the processed chunks."
-            response['progress'] = 70
-            yield json.dumps(response) + '\n'
-            for i in range(n*n):
-                response['event'] = f"Downloading chunk {i+1}/{n*n}."
-                response['progress'] = 71 + i
+                    chunk.save(f'{tmp_folder}/{request_id}-{i}.{extension}')
+                    pending_chunks.add(i)
+                    s3Client.upload_file(f'{tmp_folder}/{request_id}-{i}.{extension}', upload_bucket, f'{request_id}-{i}.{extension}')
+
+                
+                shutil.rmtree(tmp_folder)
+
+                json_message = {
+                    'request_id': request_id,
+                    'extension': extension,
+                    'operation': operation,
+                    'padding_w': padding_w,
+                    'padding_h': padding_h,
+                    'width': width,
+                    'height': height,
+                }
+
+                channel = f"pending:{request_id}"
+                
+                pubsub = r.pubsub()
+                pubsub.subscribe(channel)
+                
+                # Send message batch to the queue
+                for i, chunk in enumerate(chunks):
+                    response['event'] = f"Sending chunk {i+1}/{n*n} to the queue."
+                    response['progress'] = 21 + i
+                    yield json.dumps(response) + '\n'
+                    json_message['chunk_id'] = i
+                    encoded_jwt = jwt.encode(json_message, SECRET_KEY, algorithm='HS256')
+                    sqsClient.send_message(
+                        QueueUrl=push_queue_url,
+                        MessageBody=encoded_jwt,
+                        MessageGroupId=str(i%2),
+                        MessageDeduplicationId=f"{request_id}+{i}",
+                    )
+
+                # r.sadd(f"pending:{request_id}", *pending_chunks)
+                # r.set(f"chunk_count:{request_id}", len(pending_chunks))
+                
+                response['event'] = f"Image processing request sent. Waiting for the processed chunks."
+                response['progress'] = 30
                 yield json.dumps(response) + '\n'
-                s3Client.download_file(download_bucket, f'{request_id}-{i}.{extension}', f'{tmp_folder}/{request_id}-{i}.{extension}')
-                chunks.append(Image.open(f'{tmp_folder}/{request_id}-{i}.{extension}'))
-            response['event'] = f"Combining the chunks."
-            response['progress'] = 85
-            yield json.dumps(response) + '\n'
-            img = combine_image(chunks, n, width, height, padding_w, padding_h)
-            img.save(f'{tmp_folder}/{request_id}.{extension}')
-            response['event'] = f"Uploading the final image."
-            response['progress'] = 90
-            yield json.dumps(response) + '\n'
-            s3Client.upload_file(f'{tmp_folder}/{request_id}.{extension}', download_bucket, f'{request_id}.{extension}')
-            shutil.rmtree(tmp_folder)
-            
-            response['event'] = f"Final cleanup."
-            response['progress'] = 95
-            yield json.dumps(response) + '\n'
-            for i in range(n*n):
-                s3Client.delete_object(Bucket=download_bucket, Key=f'{request_id}-{i}.{extension}')
+                while True:
+                    message = pubsub.get_message()
+                    if message is None: continue
+                    print(message)
+                    if message['type'] == 'message':
+                        if message['data'] == b'0':
+                            break
+                        
+                        message = message['data']
+                        decoded = jwt.decode(message, SECRET_KEY, algorithms='HS256')
+                        chunk_id = decoded['chunk_id']
+                        pending_chunks.remove(chunk_id)
+                        response['event'] = f"Chunk {chunk_id} processed."
+                        response['progress'] = 30 + (9 - len(pending_chunks)) * 3
+                        yield json.dumps(response) + '\n'
+                        if len(pending_chunks) == 0:
+                            response['event'] = f"All chunks processed."
+                            yield json.dumps(response) + '\n'
+                            pubsub.unsubscribe(channel)
+                            pubsub.close()
+                            break
+                
+                r.delete(channel)
+                
+                tmp_folder = f'temp-{request_id}'
+                if not os.path.exists(tmp_folder):
+                    os.makedirs(tmp_folder)
+                chunks = []
+                response['event'] = f"Downloading the processed chunks."
+                response['progress'] = 70
+                yield json.dumps(response) + '\n'
+                for i in range(n*n):
+                    response['event'] = f"Downloading chunk {i+1}/{n*n}."
+                    response['progress'] = 71 + i
+                    yield json.dumps(response) + '\n'
+                    s3Client.download_file(download_bucket, f'{request_id}-{i}.{extension}', f'{tmp_folder}/{request_id}-{i}.{extension}')
+                    chunks.append(Image.open(f'{tmp_folder}/{request_id}-{i}.{extension}'))
+                response['event'] = f"Combining the chunks."
+                response['progress'] = 85
+                yield json.dumps(response) + '\n'
+                img = combine_image(chunks, n, width, height, padding_w, padding_h)
+                img.save(f'{tmp_folder}/{request_id}.{extension}')
+                response['event'] = f"Uploading the final image."
+                response['progress'] = 90
+                yield json.dumps(response) + '\n'
+                s3Client.upload_file(f'{tmp_folder}/{request_id}.{extension}', download_bucket, f'{request_id}.{extension}')
+                shutil.rmtree(tmp_folder)
+                
+                response['event'] = f"Final cleanup."
+                response['progress'] = 95
+                yield json.dumps(response) + '\n'
+                for i in range(n*n):
+                    s3Client.delete_object(Bucket=download_bucket, Key=f'{request_id}-{i}.{extension}')
 
-            response['event'] = f"Generating URL."
-            response['progress'] = 99
-            yield json.dumps(response) + '\n'
-            url = s3Client.generate_presigned_url('get_object', Params={'Bucket': download_bucket, 'Key': f'{request_id}.{extension}'}, ExpiresIn=3600)
-            
-            yield json.dumps({'url': url, 'progress': 100}) + '\n'
-            return {'url': url}
+                response['event'] = f"Generating URL."
+                response['progress'] = 99
+                yield json.dumps(response) + '\n'
+                url = s3Client.generate_presigned_url('get_object', Params={'Bucket': download_bucket, 'Key': f'{request_id}.{extension}'}, ExpiresIn=3600)
+                
+                yield json.dumps({'url': url, 'progress': 100, 'id': response['id']}) + '\n'
+                import time
+                time.sleep(0.1)
+            # Delete the temporary file
+            os.unlink(temp_file.name)
+        return {'url': url}
 
-    response = Response(process(temp_file), mimetype='text/event-stream')
+    response = Response(process(temp_files), mimetype='text/event-stream')
     response.headers['X-Accel-Buffering'] = 'no'
     return response
 
