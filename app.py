@@ -228,7 +228,7 @@ def image_processing():
             import time
             time.sleep(0.1)
 
-            return {'url': url}
+        return True
 
     response = Response(process(temp_files), mimetype='text/event-stream')
     response.headers['X-Accel-Buffering'] = 'no'
