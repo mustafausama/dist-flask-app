@@ -1,3 +1,7 @@
+# Video Link
+
+[Distributed Image Processing Demo and Discussion](https://drive.google.com/drive/folders/1Kj2XA7Wpx6NQtDzAKcZvVZs1ZcImYNMP?usp=drive_link)
+
 # How to deploy and run
 
 In this documentation, we will discuss the prerequisites and the steps required to deploy and run the website.
